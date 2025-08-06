@@ -36,7 +36,7 @@ Ultralytics YOLOv8 – Object detection on video frames
 
 LangChain – Prompt management and LLM pipeline
 
-Groq LLM / OpenAI API – For event generation and video summarization
+Groq LLM – For event generation and video summarization(WHILE DOING CODE PLEASE ADD YOUR OWN GROQ API KEY IN app.py)
 
 3. Data Handling & Storage
 JSON – Event logging and export
@@ -57,11 +57,14 @@ GitHub – Version control and project hosting
 
 
 🧑💻 Setup & Installation:
+1.put all the files in single folder 
+2.make sure you have installed all requirements
+3.please add your own groq api key
 
-Follow these steps to get your assistant running locally:
+4..Follow these steps to get your assistant running locally:
 cd VU-Chat-Assistant
 pip install -r requirements.txt
-# (Optional) Configure .env for API keys or DB settings.
+#Configure .env for API keys or DB settings.
 uvicorn app.main:app --reload
 
 🕹️ Usage Instructions:
