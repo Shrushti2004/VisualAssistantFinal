@@ -1,5 +1,6 @@
-ultralytics
-opencv-python
 streamlit
-groq
-
+opencv-python
+ultralytics
+langchain
+langchain-groq
+pathlib
