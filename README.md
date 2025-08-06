@@ -59,8 +59,6 @@ GitHub – Version control and project hosting
 🧑💻 Setup & Installation:
 
 Follow these steps to get your assistant running locally:
-
-git clone https://github.com/YOUR-ORG/VU-Chat-Assistant.git
 cd VU-Chat-Assistant
 pip install -r requirements.txt
 # (Optional) Configure .env for API keys or DB settings.
