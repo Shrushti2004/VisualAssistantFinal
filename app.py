@@ -1,150 +1,194 @@
+import os
+import re
+import math
+import tempfile
 import cv2
-import json
+import numpy as np
+import torch
 import time
-import streamlit as st
-from pathlib import Path
+from collections import Counter
+from typing import List, Dict, Optional
+
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi.responses import PlainTextResponse
+
 from ultralytics import YOLO
-from langchain_groq import ChatGroq
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
+from decord import VideoReader, cpu
+from transformers import VideoMAEFeatureExtractor, VideoMAEForVideoClassification
+from groq import Groq
 
-# -----------------------------
-# CONFIGURATION
-# -----------------------------
-st.set_page_config(page_title="🎥 Video Event Summarizer AI Agent", layout="wide")
-st.title("🎥 Video Event Summarizer with AI Agent")
+# ---------------- CONFIG ----------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    raise RuntimeError("Missing GROQ_API_KEY environment variable. Set: export GROQ_API_KEY=\"your_key\"")
 
-# Load YOLO model
-model = YOLO("yolov8x.pt")  # yolov8s.pt for better accuracy
+# ---------------- MODELS ----------------
+yolo_model = YOLO("yolov8x.pt")
+VIDEOMAE_MODEL = "MCG-NJU/videomae-base-finetuned-kinetics"
+videomae_extractor = VideoMAEFeatureExtractor.from_pretrained(VIDEOMAE_MODEL)
+videomae = VideoMAEForVideoClassification.from_pretrained(VIDEOMAE_MODEL).to(DEVICE).eval()
+client = Groq(api_key=GROQ_API_KEY)
 
-# Groq API key
-GROQ_API_KEY = ""
+# ---------------- HELPERS ----------------
+def sample_even_frames_decord(video_path: str, num_frames: int = 16) -> List[np.ndarray]:
+    vr = VideoReader(video_path, ctx=cpu(0))
+    total = len(vr)
+    if total == 0:
+        return []
+    idxs = [min(total - 1, math.floor(i * (total / num_frames))) for i in range(num_frames)]
+    batch = vr.get_batch(idxs).asnumpy()
+    return [f for f in batch]
 
-# Initialize ChatGroq LLM
-llm = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=GROQ_API_KEY)
-
-# Prompts
-event_prompt = PromptTemplate(
-    input_variables=["objects"],
-    template="Detected objects: {objects}. "
-             "Generate a single-sentence realistic event for a road or parking lot scene."
-)
-event_chain = LLMChain(llm=llm, prompt=event_prompt)
-
-summary_prompt = PromptTemplate(
-    input_variables=["events"],
-    template="Here is the list of detected events from a video:\n\n{events}\n\n"
-             "Generate a detailed summary of the video in 2-3 sentences."
-)
-summary_chain = LLMChain(llm=llm, prompt=summary_prompt)
-
-agent_prompt = PromptTemplate(
-    input_variables=["context", "question"],
-    template="You are an AI agent analyzing a video. "
-             "Context: {context}\nQuestion: {question}\nAnswer conversationally:"
-)
-agent_chain = LLMChain(llm=llm, prompt=agent_prompt)
-
-# -----------------------------
-# VIDEO UPLOAD
-# -----------------------------
-video_file = st.file_uploader("📤 Upload a video", type=["mp4", "avi", "mov"])
-
-if video_file:
-    video_path = Path("temp_video.mp4")
-    with open(video_path, "wb") as f:
-        f.write(video_file.read())
-
-    st.info("⏳ Processing video")
-
-    cap = cv2.VideoCapture(str(video_path))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    frame_interval = max(1, int(fps * 1))  # Every 1 second
-    frame_index = 0
-    events_log = []
-
-    while cap.isOpened():
+def extract_sampled_frames_cv(video_path: str, num_frames: int = 32) -> List[np.ndarray]:
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    if total == 0:
+        cap.release()
+        return []
+    idxs = np.linspace(0, total - 1, num_frames, dtype=int)
+    frames = []
+    for idx in idxs:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
         ret, frame = cap.read()
         if not ret:
-            break
-
-        if frame_index % frame_interval == 0:
-            timestamp = time.strftime("%H:%M:%S", time.gmtime(frame_index / fps))
-
-            # Object detection
-            results = model(frame, verbose=False)
-            detected_objects = []
-            for r in results:
-                for c in r.boxes.cls:
-                    detected_objects.append(model.names[int(c)])
-
-            if detected_objects:
-                # Generate event description
-                event_text = event_chain.run(objects=", ".join(set(detected_objects)))
-                events_log.append({"timestamp": timestamp, "event": event_text})
-
-        frame_index += 1
-
+            continue
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     cap.release()
+    return frames
 
-    # -----------------------------
-    # SAVE JSON LOG (HIDDEN FROM UI)
-    # -----------------------------
-    json_file = "video_events.json"
-    with open(json_file, "w") as f:
-        json.dump(events_log, f, indent=4)
+def detect_objects_across_frames(frames: List[np.ndarray], imgsz: int = 640, conf: float = 0.25) -> Counter:
+    hist = Counter()
+    if not frames:
+        return hist
+    step = max(1, len(frames) // 24)
+    for i in range(0, len(frames), step):
+        try:
+            results = yolo_model.predict(frames[i], imgsz=imgsz, conf=conf, device=DEVICE, verbose=False)
+            if not results:
+                continue
+            r0 = results[0]
+            try:
+                cls_list = r0.boxes.cls.tolist()
+            except Exception:
+                cls_list = []
+            for cls_id in cls_list:
+                label = yolo_model.names[int(cls_id)]
+                hist.update([label])
+        except Exception:
+            continue
+    return hist
 
-    st.success("✅ Video processing completed!")
+def recognize_action_videomae(frames: List[np.ndarray]) -> str:
+    if not frames:
+        return ""
+    if len(frames) != 16:
+        idxs = np.linspace(0, len(frames) - 1, 16, dtype=int)
+        frames = [frames[i] for i in idxs]
+    inputs = videomae_extractor(images=frames, return_tensors="pt")
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+    with torch.no_grad():
+        if DEVICE == "cuda":
+            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                logits = videomae(**inputs).logits
+        else:
+            logits = videomae(**inputs).logits
+    pred = int(logits.argmax(-1).item())
+    label = videomae.config.id2label.get(pred, "")
+    return label.replace("_", " ")
 
-    # -----------------------------
-    # FINAL VIDEO SUMMARY
-    # -----------------------------
-    final_summary = summary_chain.run(events=json.dumps(events_log, indent=4))
-    st.subheader("📌 Final Video Summary")
-    st.write(final_summary)
+def build_scene_summary(object_hist: Counter, action: str, extra_facts: Optional[str] = None) -> str:
+    top_objs = [o for o, _ in object_hist.most_common(6)]
+    obj_part = ", ".join(top_objs) if top_objs else ""
+    action_part = action.strip()
+    pieces = []
+    if obj_part:
+        pieces.append(f"Objects: {obj_part}.")
+    if action_part:
+        pieces.append(f"Primary action: {action_part}.")
+    if extra_facts:
+        pieces.append(extra_facts)
+    if not pieces:
+        return "No clear objects or actions were detected in the video."
+    return " ".join(pieces)
 
-    # Download JSON only (no JSON display on UI)
-    st.download_button("📥 Download Event JSON",
-                       data=json.dumps(events_log, indent=4),
-                       file_name=json_file,
-                       mime="application/json")
+def is_mcq(prompt: str) -> bool:
+    return bool(re.search(r"\bA\.", prompt, re.IGNORECASE))
 
-    # -----------------------------
-    # CHATGPT-STYLE MULTI-TURN BOT
-    # -----------------------------
-    st.subheader("🤖 Chat with the AI Agent About the Video")
+def parse_mcq_options(prompt: str) -> Dict[str, str]:
+    parts = re.split(r"(\b[A-D]\.)", prompt)
+    options: Dict[str, str] = {}
+    cur = None; buf = []
+    for p in parts:
+        if re.fullmatch(r"[A-D]\.", p):
+            if cur and buf:
+                options[cur] = " ".join(" ".join(buf).split()).strip()
+            cur = p[0]; buf = []
+        else:
+            if cur:
+                buf.append(p)
+    if cur and buf:
+        options[cur] = " ".join(" ".join(buf).split()).strip()
+    for k in list(options.keys()):
+        options[k] = re.sub(r"\s*[A-D]\.\s*$", "", options[k]).strip()
+    return options
 
-    # Initialize session state for chat
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+def groq_answer_mcq(summary: str, prompt: str, options: Dict[str,str]) -> str:
+    messages = [
+        {"role":"system","content":"You are a video QA assistant. Use ONLY the provided summary to answer MCQs."},
+        {"role":"user","content": f"Video summary: {summary}\nQuestion: {prompt}\nOptions: {'; '.join([f'{k}. {v}' for k,v in options.items()])}\n\nRespond with EXACTLY one option in the format 'LETTER. option text'."}
+    ]
+    resp = client.chat.completions.create(model=GROQ_MODEL, messages=messages, temperature=0.0, max_tokens=30)
+    text = resp.choices[0].message.content.strip()
+    m = re.match(r"^\s*([A-D])\s*\.?\s*(.*)$", text, flags=re.IGNORECASE)
+    if m:
+        letter, tail = m.group(1).upper(), m.group(2).strip()
+        if not tail and letter in options:
+            return f"{letter}. {options[letter]}"
+        return f"{letter}. {tail or options.get(letter,'')}".strip()
+    if options:
+        k = sorted(options.keys())[0]
+        return f"{k}. {options[k]}"
+    return text
 
-    # Display chat history in ChatGPT style
-    for chat in st.session_state.chat_history:
-        with st.chat_message("user"):
-            st.write(chat["user"])
-        with st.chat_message("assistant"):
-            st.write(chat["ai"])
+def groq_answer_descriptive(summary: str, prompt: str) -> str:
+    messages = [
+        {"role":"system","content":"You are a concise assistant that answers questions about videos using the provided summary."},
+        {"role":"user","content": f"Video summary: {summary}\nQuestion: {prompt}\nAnswer in 1-2 short sentences, plain text only."}
+    ]
+    resp = client.chat.completions.create(model=GROQ_MODEL, messages=messages, temperature=0.2, max_tokens=120)
+    return resp.choices[0].message.content.strip()
 
-    # Chat input box
-    user_query = st.chat_input("Ask anything about the video...")
+# ---------------- APP ----------------
+app = FastAPI()
 
-    if user_query:
-        # Generate AI response
-        ai_response = agent_chain.run({
-            "context": json.dumps(events_log, indent=4),
-            "question": user_query
-        })
+@app.post("/infer", response_class=PlainTextResponse)
+async def infer(video: UploadFile = File(...), prompt: str = Form(...)):
+    start_time = time.time()
 
-        # Append to history
-        st.session_state.chat_history.append({
-            "user": user_query,
-            "ai": ai_response
-        })
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+        tmp.write(await video.read())
+        video_path = tmp.name
 
-        # Display the new messages immediately
-        with st.chat_message("user"):
-            st.write(user_query)
-        with st.chat_message("assistant"):
-            st.write(ai_response)
+    frames_for_action = sample_even_frames_decord(video_path, num_frames=16)
+    frames_for_objects = extract_sampled_frames_cv(video_path, num_frames=32)
+
+    object_hist = detect_objects_across_frames(frames_for_objects)
+    action_label = recognize_action_videomae(frames_for_action)
+    summary = build_scene_summary(object_hist, action_label)
+
+    if is_mcq(prompt):
+        options = parse_mcq_options(prompt)
+        if not options:
+            answer = groq_answer_descriptive(summary, prompt)
+        else:
+            answer = groq_answer_mcq(summary, prompt, options)
+    else:
+        answer = groq_answer_descriptive(summary, prompt)
+
+    total_time = time.time() - start_time
+    print(f"[PERFORMANCE] Total inference time: {total_time:.2f} seconds")
+
+    return f"{prompt}\nAnswer: {answer}"
