@@ -1,6 +1,10 @@
-streamlit
-opencv-python
-ultralytics
-langchain
-langchain-groq
-pathlib
+fastapi==0.111.0
+uvicorn[standard]==0.23.2
+torch==2.2.0
+torchvision==0.17.1
+transformers==4.43.0
+ultralytics==8.0.175
+opencv-python-headless==4.8.1.78
+numpy==1.25.2
+decord==0.6.1
+groq==0.0.3
