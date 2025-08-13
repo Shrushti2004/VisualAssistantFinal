@@ -56,7 +56,7 @@ pip install -r requirements.txt
 
 🎥 Demo Video: https://drive.google.com/drive/folders/1bW5Z6Y3t7V8oPgGQ43uTR-31nXd-UB-4
 
-🖼️ Architecture Diagram: https://drive.google.com/file/d/1rmGZmFwCq3SMG1ZZC1M-DhNfkjcqdtin/view?usp=sharing
+🖼️ Architecture Diagram: https://drive.google.com/file/d/1zVuQBDn9g-aoN6p2xEb53TsELViaZKd2/view?usp=drive_link
 
 
 
